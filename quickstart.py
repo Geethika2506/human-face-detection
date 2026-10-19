@@ -1,6 +1,8 @@
 """
 Quick Start Guide - Face Detection Module
 
+The recognition demo is documented in README.md. Run it with: python demo.py
+
 This file contains the most common usage patterns to get started quickly.
 Copy and paste these snippets into your own scripts.
 """

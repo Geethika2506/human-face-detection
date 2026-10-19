@@ -1,59 +1,65 @@
-"""
-Face Detection Module for Student Attendance System
+"""Local face detection and recognition.
 
-This module provides face detection capabilities using OpenCV and deep neural networks.
-It is designed as the first component of a multi-module attendance system.
+YuNet finds each face and five landmarks. SFace aligns that face and produces a
+128-d embedding. FaceRecognizer compares the embedding with the local gallery.
 
-Component Structure:
-    1. FaceDetector: Detects faces in frames
-    2. DetectionResult: Stores detection output (boxes, crops, confidence)
-    3. FaceRecognizer: Placeholder for future recognition module
-    
-Data Flow:
-    WebcamCapture -> FaceDetector -> DetectionResult -> [FaceRecognizer (future)]
+``confidence`` is the detector score. ``match_score`` is cosine similarity.
+``recognition_confidence`` is left unset so it is not read as a probability.
+``recognized_name`` and ``recognized_student_id`` are filled only for a known
+match. ``recognized_student_id`` stores the enrolled person id.
 """
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-import logging
-from pathlib import Path
 
-
-# Configure logging for detection and recognition separately
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s'
+import config
+from gallery import Gallery
+from matching import IdentityRecord, MatchDecision, decide_identity, l2_normalize
+from model_assets import (
+    DETECTOR_FILENAME,
+    DETECTOR_SHA256,
+    RECOGNIZER_FILENAME,
+    RECOGNIZER_SHA256,
+    ModelAssetError,
+    model_path,
+    verify_model,
 )
 
-detection_logger = logging.getLogger('DETECTION')
-recognition_logger = logging.getLogger('RECOGNITION')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(name)s] - %(levelname)s - %(message)s",
+)
+
+detection_logger = logging.getLogger("DETECTION")
+recognition_logger = logging.getLogger("RECOGNITION")
 
 
 @dataclass
 class Face:
-    """
-    Represents a detected face with its associated metadata.
-    
-    Attributes:
-        bbox (Tuple[int, int, int, int]): Bounding box as (x, y, width, height)
-        crop (np.ndarray): Cropped face image for further processing
-        confidence (float): Detection confidence score (0.0 to 1.0)
-        frame_index (int): Index of the frame in which face was detected
-    """
-    bbox: Tuple[int, int, int, int]
+    """A face found in one frame."""
+
+    bbox: tuple[int, int, int, int]
     crop: np.ndarray
     confidence: float
     frame_index: int
-    
-    # Placeholder for recognition results (will be populated by FaceRecognizer)
     recognized_student_id: Optional[str] = None
     recognized_name: Optional[str] = None
     recognition_confidence: Optional[float] = None
-    
-    def __post_init__(self):
-        """Validate face data on initialization."""
+    recognized_person_id: Optional[str] = None
+    recognition_status: Optional[str] = None
+    match_score: Optional[float] = None
+    match_margin: Optional[float] = None
+    landmarks: Optional[tuple[tuple[float, float], ...]] = None
+    yunet_row: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError(f"Confidence must be between 0 and 1, got {self.confidence}")
         if self.crop is None or self.crop.size == 0:
@@ -61,366 +67,294 @@ class Face:
 
 
 class DetectionResult:
-    """
-    Container for face detection results from a single frame.
-    Stores both detection and recognition data separately for clarity.
-    
-    This class bridges detection output with recognition module input.
-    """
-    
-    def __init__(self, frame_index: int, frame_shape: Tuple[int, int, int]):
-        """
-        Initialize detection result.
-        
-        Args:
-            frame_index: Index of the processed frame
-            frame_shape: Original frame shape (height, width, channels)
-        """
+    """Faces found in a single frame."""
+
+    def __init__(self, frame_index: int, frame_shape: tuple[int, ...]):
         self.frame_index = frame_index
         self.frame_shape = frame_shape
-        self.detected_faces: List[Face] = []
-        self.detection_timestamps = []
-    
+        self.detected_faces: list[Face] = []
+
     def add_face(self, face: Face) -> None:
-        """Add a detected face to results."""
         self.detected_faces.append(face)
-    
-    def get_faces_for_recognition(self) -> List[Face]:
-        """
-        Get all detected faces formatted for recognition module input.
-        
-        Returns:
-            List of Face objects ready for recognition processing.
-            
-        Note:
-            This method is called by the FaceRecognizer to process detection results.
-            Each Face object contains the crop and metadata needed for recognition.
-        """
+
+    def get_faces_for_recognition(self) -> list[Face]:
         return self.detected_faces
-    
+
     def summary(self) -> str:
-        """Return a summary of detection results."""
+        if not self.detected_faces:
+            return "No faces detected"
+        average = float(np.mean([face.confidence for face in self.detected_faces]))
         return (
             f"Frame {self.frame_index}: "
             f"{len(self.detected_faces)} face(s) detected. "
-            f"Avg confidence: "
-            f"{np.mean([f.confidence for f in self.detected_faces]):.2f}" 
-            if self.detected_faces else "No faces detected"
+            f"Avg confidence: {average:.2f}"
         )
 
 
 class FaceDetector:
-    """
-    Face detection using OpenCV DNN module with pre-trained ResNet model.
-    
-    This detector uses a deep neural network trained on face detection,
-    providing more reliable detections compared to Haar Cascades.
-    
-    The output (DetectionResult) is structured to easily pass to downstream
-    recognition and attendance marking modules.
-    """
-    
-    # Pre-trained model paths (included with OpenCV)
-    PROTO_PATH = cv2.data.haarcascades + 'lbpcascade_frontalface_improved.xml'
-    
-    def __init__(self, confidence_threshold: float = 0.5):
-        """
-        Initialize the face detector.
-        
-        Args:
-            confidence_threshold: Minimum confidence score to consider a detection valid (0.0-1.0)
-        """
+    """YuNet detector. Boxes and landmarks are returned in full-frame coordinates."""
+
+    def __init__(
+        self,
+        confidence_threshold: float = config.DETECTION_CONFIDENCE_DEFAULT,
+        model_path: str | Path | None = None,
+        detect_max_side: int = config.DETECT_MAX_SIDE,
+        nms_threshold: float = config.DETECTION_NMS_THRESHOLD,
+        top_k: int = config.DETECTION_TOP_K,
+        backend=None,
+    ):
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be between 0 and 1")
         self.confidence_threshold = confidence_threshold
+        self.detect_max_side = detect_max_side
+        self.nms_threshold = nms_threshold
+        self.top_k = top_k
         self.frame_count = 0
-        
-        # Load cascade classifier (alternative method, fast but less accurate)
-        try:
-            self.cascade = cv2.CascadeClassifier(self.PROTO_PATH)
-            if self.cascade.empty():
-                detection_logger.warning("Cascade classifier failed to load, will use alternative method")
-                self.cascade = None
-        except Exception as e:
-            detection_logger.error(f"Error loading cascade: {e}")
-            self.cascade = None
-        
-        # Modern DNN-based detector setup (more accurate)
-        self.setup_dnn_detector()
-        
+        self.model_path = Path(model_path) if model_path else model_path_default(DETECTOR_FILENAME)
+        self.model_sha256 = DETECTOR_SHA256
+        if backend is not None:
+            self.detector = backend
+        else:
+            self.model_sha256 = verify_model(self.model_path, DETECTOR_SHA256)
+            self.detector = self._create_detector()
         detection_logger.info(
-            f"FaceDetector initialized with confidence threshold: {confidence_threshold}"
+            "FaceDetector initialized with YuNet (confidence %.2f, max side %s)",
+            confidence_threshold,
+            detect_max_side,
         )
-    
-    def setup_dnn_detector(self) -> None:
-        """
-        Set up deep neural network-based face detector.
-        Uses the Caffe model for face detection (included with OpenCV).
-        """
+
+    def _create_detector(self):
         try:
-            # OpenCV's pre-trained DNN models for face detection
-            opencv_dir = cv2.data.haarcascades.replace('haarcascades', 'dnn')
-            
-            # Try to load DNN model
-            model_file = Path(opencv_dir).parent / 'dnn' / 'opencv_face_detector_uint8.pb'
-            config_file = Path(opencv_dir).parent / 'dnn' / 'opencv_face_detector.pbtxt'
-            
-            if model_file.exists() and config_file.exists():
-                self.net = cv2.dnn.readNetFromTensorflow(str(model_file), str(config_file))
-                self.use_dnn = True
-                detection_logger.info("DNN detector loaded successfully")
-            else:
-                detection_logger.info("DNN model files not found, will use Cascade Classifier")
-                self.use_dnn = False
-                self.net = None
-        except Exception as e:
-            detection_logger.warning(f"DNN setup failed: {e}, falling back to Cascade Classifier")
-            self.use_dnn = False
-            self.net = None
-    
+            detector = cv2.FaceDetectorYN.create(
+                str(self.model_path),
+                "",
+                (320, 320),
+                self.confidence_threshold,
+                self.nms_threshold,
+                self.top_k,
+            )
+        except Exception as exc:
+            raise ModelAssetError(f"Could not load YuNet model: {self.model_path}") from exc
+        if detector is None:
+            raise ModelAssetError(f"Could not load YuNet model: {self.model_path}")
+        return detector
+
     def detect(self, frame: np.ndarray) -> DetectionResult:
-        """
-        Detect faces in a single frame.
-        
-        Args:
-            frame: Input frame (BGR color image from OpenCV)
-        
-        Returns:
-            DetectionResult containing all detected faces with confidence scores
-        
-        Flow to Recognition:
-            1. FaceDetector.detect() returns DetectionResult
-            2. DetectionResult.get_faces_for_recognition() extracts Face objects
-            3. Face.crop images are sent to FaceRecognizer for identity matching
-            4. Recognition results populate Face.recognized_student_id, etc.
-        """
+        """Detect faces. The YuNet score is stored on Face.confidence."""
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("detect() expects a BGR image with shape (height, width, 3)")
+        if frame.shape[0] == 0 or frame.shape[1] == 0:
+            raise ValueError("detect() received an empty image")
+
         self.frame_count += 1
         result = DetectionResult(self.frame_count, frame.shape)
-        
-        # Convert to grayscale for cascade detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect faces using best available method
-        if self.use_dnn and self.net is not None:
-            detected_boxes = self._detect_with_dnn(frame, gray)
-        elif self.cascade is not None:
-            detected_boxes = self._detect_with_cascade(gray)
-        else:
-            detection_logger.warning("No detection method available")
-            return result
-        
-        # Process detections and create Face objects
-        for (x, y, w, h, conf) in detected_boxes:
-            if conf >= self.confidence_threshold:
-                # Ensure bounding box is within frame bounds
-                x = max(0, x)
-                y = max(0, y)
-                w = min(w, frame.shape[1] - x)
-                h = min(h, frame.shape[0] - y)
-                
-                # Extract face crop for recognition module
-                face_crop = frame[y:y+h, x:x+w].copy()
-                
-                # Create Face object
-                face = Face(
-                    bbox=(x, y, w, h),
-                    crop=face_crop,
-                    confidence=conf,
-                    frame_index=self.frame_count
-                )
-                
-                result.add_face(face)
-                detection_logger.debug(
-                    f"Face detected - Box: ({x}, {y}, {w}, {h}), "
-                    f"Confidence: {conf:.4f}"
-                )
-        
-        detection_logger.info(f"Frame {self.frame_count}: {len(result.detected_faces)} face(s) detected")
-        
-        return result
-    
-    def _detect_with_cascade(self, gray: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
-        """
-        Detect faces using Haar Cascade Classifier.
-        
-        Returns:
-            List of (x, y, w, h, confidence) tuples
-        """
-        boxes = self.cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        
-        # Convert to list with normalized confidence (cascade doesn't return confidence)
-        detections = []
-        for (x, y, w, h) in boxes:
-            detections.append((x, y, w, h, 0.85))  # Use default confidence for cascade
-        
-        return detections
-    
-    def _detect_with_dnn(self, frame: np.ndarray, gray: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
-        """
-        Detect faces using DNN (more accurate than Cascade).
-        
-        Returns:
-            List of (x, y, w, h, confidence) tuples
-        """
-        detections = []
-        
-        try:
-            h, w = frame.shape[:2]
-            
-            # Prepare blob for network input
-            blob = cv2.dnn.blobFromImage(
-                frame, 1.0, (300, 300),
-                [104.0, 117.0, 123.0], False, False
+        resized, scale = _resize_for_detector(frame, self.detect_max_side)
+        self.detector.setInputSize((resized.shape[1], resized.shape[0]))
+        faces = _unwrap_faces(self.detector.detect(resized))
+
+        for row in faces:
+            if row.shape[0] < 15:
+                continue
+            score = float(row[14])
+            if score < self.confidence_threshold:
+                continue
+            full_row = row.astype(np.float32).copy()
+            if scale != 1.0:
+                full_row[:14] /= np.float32(scale)
+            bbox = _clip_bbox(full_row[:4], frame.shape)
+            if bbox is None:
+                continue
+            x, y, width, height = bbox
+            face = Face(
+                bbox=bbox,
+                crop=frame[y : y + height, x : x + width].copy(),
+                confidence=min(max(score, 0.0), 1.0),
+                frame_index=self.frame_count,
+                landmarks=_landmarks(full_row),
+                yunet_row=full_row,
             )
-            
-            self.net.setInput(blob)
-            result = self.net.forward()
-            
-            # Parse detections with confidence scores
-            for detection in result[0][0]:
-                confidence = detection[2]
-                
-                if confidence > self.confidence_threshold:
-                    x1 = int(detection[3] * w)
-                    y1 = int(detection[4] * h)
-                    x2 = int(detection[5] * w)
-                    y2 = int(detection[6] * h)
-                    
-                    box_w = x2 - x1
-                    box_h = y2 - y1
-                    
-                    detections.append((x1, y1, box_w, box_h, float(confidence)))
-        
-        except Exception as e:
-            detection_logger.error(f"Error in DNN detection: {e}")
-        
-        return detections
-    
+            result.add_face(face)
+
+        detection_logger.debug(
+            "Frame %s: %s face(s) detected",
+            self.frame_count,
+            len(result.detected_faces),
+        )
+        return result
+
     def get_stats(self) -> dict:
-        """Return detection statistics."""
         return {
-            'total_frames_processed': self.frame_count,
-            'confidence_threshold': self.confidence_threshold,
-            'detector_type': 'DNN' if self.use_dnn else 'Cascade'
+            "total_frames_processed": self.frame_count,
+            "confidence_threshold": self.confidence_threshold,
+            "detector_type": "YuNet",
+            "model": self.model_path.name,
         }
 
 
 class FaceRecognizer:
-    """
-    Placeholder for face recognition module (to be implemented later).
-    
-    This class will be implemented in the next phase to:
-    1. Accept DetectionResult objects from FaceDetector
-    2. Process Face.crop images for student identification
-    3. Populate Face.recognized_student_id, Face.recognized_name, 
-       and Face.recognition_confidence
-    4. Log recognition results separately from detection
-    
-    Integration Flow:
-        detector = FaceDetector()
-        recognizer = FaceRecognizer(model_path='...')
-        
-        frame = capture_frame()
-        detection_result = detector.detect(frame)
-        
-        # Pass detected faces to recognizer
+    """SFace embeddings matched against the local gallery."""
+
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        gallery: Gallery | None = None,
+        gallery_dir: str | Path | None = None,
+        accept_threshold: float = config.ACCEPT_THRESHOLD,
+        match_margin: float = config.MATCH_MARGIN,
+        backend=None,
+    ):
+        self.accept_threshold = accept_threshold
+        self.match_margin = match_margin
+        self.model_path = Path(model_path) if model_path else model_path_default(RECOGNIZER_FILENAME)
+        self.opencv_version = cv2.__version__
+        if backend is not None:
+            self.backend = backend
+            self.model_sha256 = RECOGNIZER_SHA256
+        else:
+            self.model_sha256 = verify_model(self.model_path, RECOGNIZER_SHA256)
+            self.backend = self._create_recognizer()
+        self.gallery = gallery or Gallery(
+            gallery_dir or config.GALLERY_DIR,
+            detector_sha256=DETECTOR_SHA256,
+            recognizer_sha256=self.model_sha256,
+        )
+        recognition_logger.info(
+            "FaceRecognizer initialized (cosine threshold %.3f, margin %.3f)",
+            accept_threshold,
+            match_margin,
+        )
+
+    def _create_recognizer(self):
+        try:
+            recognizer = cv2.FaceRecognizerSF.create(str(self.model_path), "")
+        except Exception as exc:
+            raise ModelAssetError(f"Could not load SFace model: {self.model_path}") from exc
+        if recognizer is None:
+            raise ModelAssetError(f"Could not load SFace model: {self.model_path}")
+        return recognizer
+
+    def embed(self, frame: np.ndarray, yunet_row: np.ndarray) -> np.ndarray:
+        """Align with the YuNet row and return an L2-normalized 128-d embedding."""
+        if yunet_row is None:
+            raise ValueError("A YuNet detection row is required to align the face")
+        row = np.asarray(yunet_row, dtype=np.float32).reshape(-1)
+        aligned = self.backend.alignCrop(frame, row)
+        feature = self.backend.feature(aligned)
+        return l2_normalize(feature)
+
+    def match_face(
+        self,
+        face: Face,
+        frame: np.ndarray,
+        identities: list[IdentityRecord] | None = None,
+    ) -> MatchDecision:
+        """Fill recognition fields on ``face`` and return the decision."""
+        if identities is None:
+            identities = self.gallery.identity_records()
+        try:
+            embedding = self.embed(frame, face.yunet_row)
+            decision = decide_identity(
+                embedding,
+                identities,
+                self.accept_threshold,
+                self.match_margin,
+            )
+        except (ValueError, cv2.error) as exc:
+            recognition_logger.warning("Could not embed a face: %s", exc)
+            decision = MatchDecision(status="unknown")
+        _apply_decision(face, decision)
+        return decision
+
+    def batch_recognize(self, detection_result: DetectionResult, frame: np.ndarray) -> DetectionResult:
+        """Recognize every face. Alignment uses the full frame, not only the crop."""
+        identities = self.gallery.identity_records()
         for face in detection_result.get_faces_for_recognition():
-            student_id, name, rec_confidence = recognizer.recognize(face.crop)
-            face.recognized_student_id = student_id
-            face.recognized_name = name
-            face.recognition_confidence = rec_confidence
-    """
-    
-    def __init__(self, model_path: Optional[str] = None):
-        """
-        Initialize face recognizer (stub for future implementation).
-        
-        Args:
-            model_path: Path to pre-trained recognition model (e.g., face embedding model)
-        """
-        self.model_path = model_path
-        self.model = None
-        
-        recognition_logger.info("FaceRecognizer initialized (placeholder - not yet implemented)")
-    
-    def recognize(self, face_crop: np.ndarray) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-        """
-        Recognize a student from a face crop.
-        
-        This method will be implemented to:
-        1. Extract face embeddings from the crop
-        2. Compare against student database
-        3. Return student ID, name, and confidence
-        
-        Args:
-            face_crop: Cropped face image from FaceDetector.Face.crop
-        
-        Returns:
-            Tuple of (student_id, student_name, confidence_score)
-            Currently returns (None, None, None) as placeholder
-        
-        Example Future Implementation:
-            def recognize(self, face_crop):
-                embedding = self.model.get_embedding(face_crop)
-                student_id, confidence = self.db.find_closest_match(embedding)
-                student_name = self.db.get_student_name(student_id)
-                recognition_logger.info(
-                    f"Recognized: {student_name} (ID: {student_id}, "
-                    f"Confidence: {confidence:.4f})"
-                )
-                return student_id, student_name, confidence
-        """
-        recognition_logger.warning("FaceRecognizer.recognize() not yet implemented")
-        return None, None, None
-    
-    def batch_recognize(self, detection_result: DetectionResult) -> DetectionResult:
-        """
-        Batch process multiple detected faces (future implementation).
-        
-        This method will process entire DetectionResult objects, populating
-        recognition data for each Face object.
-        
-        Args:
-            detection_result: DetectionResult from FaceDetector.detect()
-        
-        Returns:
-            Same DetectionResult with recognition fields populated
-        """
-        for face in detection_result.get_faces_for_recognition():
-            student_id, name, rec_conf = self.recognize(face.crop)
-            face.recognized_student_id = student_id
-            face.recognized_name = name
-            face.recognition_confidence = rec_conf
-        
+            self.match_face(face, frame, identities=identities)
         return detection_result
 
 
 class AttendanceLogger:
-    """
-    Centralized logger for attendance system events.
-    Keeps detection and recognition logs separate for debugging and auditing.
-    """
-    
+    """Kept so older examples still import. The webcam demo does not mark attendance."""
+
     @staticmethod
     def log_detection_event(frame_idx: int, num_faces: int, avg_confidence: float) -> None:
-        """Log face detection event."""
         detection_logger.info(
-            f"Frame {frame_idx}: Detected {num_faces} face(s), "
-            f"avg confidence: {avg_confidence:.4f}"
+            "Frame %s: Detected %s face(s), avg detector score: %.4f",
+            frame_idx,
+            num_faces,
+            avg_confidence,
         )
-    
+
     @staticmethod
     def log_recognition_event(student_id: str, confidence: float) -> None:
-        """Log face recognition event."""
-        recognition_logger.info(
-            f"Recognized student: {student_id}, confidence: {confidence:.4f}"
-        )
-    
+        recognition_logger.info("Recognition event: %s, score: %.4f", student_id, confidence)
+
     @staticmethod
     def log_attendance_mark(student_id: str, timestamp: str) -> None:
-        """Log attendance marking event."""
-        recognition_logger.info(f"Attendance marked for student: {student_id} at {timestamp}")
+        recognition_logger.info("Attendance mark requested for %s at %s", student_id, timestamp)
+
+
+def model_path_default(filename: str) -> Path:
+    return model_path(filename)
+
+
+def _apply_decision(face: Face, decision: MatchDecision) -> None:
+    face.recognition_status = decision.status
+    face.match_score = decision.match_score
+    face.match_margin = decision.match_margin
+    face.recognition_confidence = None
+    if decision.status == "known":
+        face.recognized_person_id = decision.person_id
+        face.recognized_student_id = decision.person_id
+        face.recognized_name = decision.display_name
+    else:
+        face.recognized_person_id = None
+        face.recognized_student_id = None
+        face.recognized_name = None
+
+
+def _resize_for_detector(frame: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Shrink the longest side to ``max_side``. Scale is resized / original."""
+    height, width = frame.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return frame, 1.0
+    scale = max_side / float(longest)
+    resized = cv2.resize(
+        frame,
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    return resized, scale
+
+
+def _unwrap_faces(raw) -> np.ndarray:
+    faces = raw[1] if isinstance(raw, tuple) else raw
+    if faces is None:
+        return np.empty((0, 15), dtype=np.float32)
+    array = np.asarray(faces, dtype=np.float32)
+    if array.size == 0:
+        return np.empty((0, 15), dtype=np.float32)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    return array
+
+
+def _clip_bbox(box: np.ndarray, frame_shape: tuple[int, ...]) -> tuple[int, int, int, int] | None:
+    height, width = frame_shape[:2]
+    x = max(0, int(np.floor(box[0])))
+    y = max(0, int(np.floor(box[1])))
+    right = min(width, int(np.ceil(box[0] + box[2])))
+    bottom = min(height, int(np.ceil(box[1] + box[3])))
+    box_width = right - x
+    box_height = bottom - y
+    if box_width <= 0 or box_height <= 0:
+        return None
+    return x, y, box_width, box_height
+
+
+def _landmarks(row: np.ndarray) -> tuple[tuple[float, float], ...]:
+    points = []
+    for index in range(5):
+        points.append((float(row[4 + 2 * index]), float(row[5 + 2 * index])))
+    return tuple(points)

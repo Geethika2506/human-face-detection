@@ -1,6 +1,8 @@
 """
 Advanced Usage Examples for Face Detection Module
 
+The recognition demo is documented in README.md. Run it with: python demo.py
+
 This file contains practical examples demonstrating various use cases:
 1. Batch processing video files
 2. Custom confidence thresholding per frame

@@ -1,17 +1,21 @@
-"""
-Unit tests and validation for the Face Detection Module
+"""Unit tests for detection results and the YuNet / SFace wrappers.
 
-Run tests with:
-    python -m pytest test_face_detection.py -v
-    
-Or run directly:
-    python test_face_detection.py
+Run from the repository root:
+
+    python -m pytest tests/test_face_detection.py -v
 """
+
+import sys
+import unittest
+from pathlib import Path
 
 import cv2
 import numpy as np
-import unittest
-from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from face_detection import (
     Face, FaceDetector, DetectionResult,
     FaceRecognizer, AttendanceLogger
@@ -134,10 +138,9 @@ class TestFaceDetector(unittest.TestCase):
         self.assertEqual(self.detector.frame_count, 0)
     
     def test_detector_with_invalid_threshold(self):
-        """Test detector with invalid confidence threshold."""
-        detector = FaceDetector(confidence_threshold=1.5)
-        # Should not raise during init
-        self.assertEqual(detector.confidence_threshold, 1.5)
+        """An out-of-range detector threshold is rejected."""
+        with self.assertRaises(ValueError):
+            FaceDetector(confidence_threshold=1.5)
     
     def test_detect_empty_frame(self):
         """Test detection on empty frame."""
@@ -169,41 +172,27 @@ class TestFaceDetector(unittest.TestCase):
 
 
 class TestFaceRecognizer(unittest.TestCase):
-    """Test FaceRecognizer placeholder."""
-    
+    """Recognizer fields stay empty when a face cannot be aligned."""
+
     def setUp(self):
-        """Initialize recognizer."""
         self.recognizer = FaceRecognizer()
         self.test_crop = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-    
-    def test_recognizer_initialization(self):
-        """Test recognizer initialization."""
-        self.assertIsNone(self.recognizer.model)
-    
-    def test_recognize_returns_none(self):
-        """Test that recognize returns None (not yet implemented)."""
-        result = self.recognizer.recognize(self.test_crop)
-        
-        self.assertEqual(result, (None, None, None))
-    
-    def test_batch_recognize(self):
-        """Test batch recognition."""
+
+    def test_unaligned_face_is_unknown(self):
         result = DetectionResult(1, (480, 640, 3))
-        
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
         for i in range(3):
-            face = Face(
-                bbox=(10 + i*50, 20, 100, 120),
-                crop=self.test_crop,
-                confidence=0.9,
-                frame_index=1
+            result.add_face(
+                Face(
+                    bbox=(10 + i * 50, 20, 100, 120),
+                    crop=self.test_crop,
+                    confidence=0.9,
+                    frame_index=1,
+                )
             )
-            result.add_face(face)
-        
-        # Batch recognize
-        result = self.recognizer.batch_recognize(result)
-        
-        # All should have None recognition results
+        result = self.recognizer.batch_recognize(result, frame)
         for face in result.detected_faces:
+            self.assertEqual(face.recognition_status, "unknown")
             self.assertIsNone(face.recognized_student_id)
             self.assertIsNone(face.recognized_name)
             self.assertIsNone(face.recognition_confidence)
@@ -244,17 +233,9 @@ class TestIntegration(unittest.TestCase):
         faces_for_rec = detection_result.get_faces_for_recognition()
         self.assertIsInstance(faces_for_rec, list)
         
-        # Step 3: [Future] Would call recognizer on each face
-        for face in faces_for_rec:
-            # Simulate recognition (would be real in phase 2)
-            student_id, name, conf = recognizer.recognize(face.crop)
-            
-            # Populate recognition results
-            face.recognized_student_id = student_id
-            face.recognized_name = name
-            face.recognition_confidence = conf
-        
-        # Verify structure is ready for recognition results
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        recognizer.batch_recognize(detection_result, frame)
+
         for face in detection_result.detected_faces:
             # All faces should have these attributes
             self.assertTrue(hasattr(face, 'recognized_student_id'))

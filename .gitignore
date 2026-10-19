@@ -42,6 +42,21 @@ ENV/
 saved_faces/
 saved_frames/
 logs/
+models/*.onnx
+models/*.partial
+
+# Personal photos, embeddings, and reports. Empty folder markers stay in git.
+data/photos/*
+!data/photos/.gitkeep
+data/gallery/*
+!data/gallery/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
+eval_data/**/*.jpg
+eval_data/**/*.jpeg
+eval_data/**/*.png
+eval_data/**/*.bmp
+eval_data/**/*.webp
 *.log
 *.db
 *.sqlite
