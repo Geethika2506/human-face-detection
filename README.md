@@ -1,15 +1,24 @@
-# Local webcam face recognition
+# Face-recognition attendance with a camera
 
-Opt-in demo for this laptop. You enroll yourself or a consenting person, then start the webcam and read the name on screen. Someone who is not enrolled is shown as **Unknown**. Two enrolled people who score too close together are shown as **Uncertain**.
+Local attendance for this laptop. Students who agreed to take part are enrolled once. During a class the Mac camera acts as a CCTV camera: every enrolled student it recognizes is checked in with a **timestamp** and a **location**. Someone who is not enrolled is shown as **Unknown**. Two enrolled people who score too close together are shown as **Uncertain**, and neither is checked in.
 
 Run every command from the repository root, with the virtual environment activated.
 
 ## What you can do
 
 1. Download the YuNet and SFace model files.
-2. Enroll from the webcam, or from photos you place in `data/photos`.
-3. Run the live demo and read the name, status, and cosine score.
-4. Score a separate set of photos with `evaluate.py` when you want measured rates.
+2. Enroll students from the webcam, or from photos you place in `data/photos`.
+3. Take attendance with `attend.py run`, then print or export the report with `attend.py report`.
+4. Run the plain recognition demo (`demo.py`) to check names and scores without recording anything.
+5. Score a separate set of photos with `evaluate.py` when you want measured rates.
+
+Quick start:
+
+```bash
+python enroll.py webcam --person-id s001 --name "Ada Lovelace"
+python attend.py run --session "CS101 Lecture" --location "Room 101, Science Block" --late-after 10
+python attend.py report --session-id 1 --csv data/attendance/cs101.csv
+```
 
 Photos and embeddings stay on this computer. `scripts/download_models.py` is the only network step, and it downloads the two OpenCV model files.
 
@@ -47,8 +56,10 @@ face_detection.py          YuNet detector and SFace recognizer
 matching.py                Max-cosine decision, threshold, and margin
 gallery.py                 Local profiles under data/gallery
 quality.py                 Enrollment quality gates
-camera.py                  Open the webcam, read the latest frame, release it
+camera.py                  Open the webcam or a stream URL, read the latest frame, release it
 tracking.py                IoU tracks and label smoothing
+attendance.py              Camera stations, check-ins, sightings, SQLite store, reports
+attend.py                  Attendance command: run, sessions, report, delete-session
 model_assets.py            Pinned model names, hashes, and download
 enroll.py                  Webcam or folder enrollment
 demo.py                    Webcam demo
@@ -58,13 +69,12 @@ tests/                     Unit tests
 data/photos/               Put enrollment photos here
 data/gallery/              Saved profiles (created when you enroll)
 data/reports/              JSON evaluation reports
+data/attendance/           attendance.db and optional check-in snapshots (created on first run)
 models/                    YuNet and SFace weights
 eval_data/                 Calibration and final photo sets
 ```
 
-`quickstart.py` and `examples.py` are an earlier detection-only draft. The demo, enrollment, and evaluation commands above are the working path.
-
-Personal photos, gallery files, reports, and model weights are ignored by git. The empty folders are kept so the layout is visible.
+Personal photos, gallery files, attendance records, reports, and model weights are ignored by git. The empty folders are kept so the layout is visible.
 
 ## Put a picture in data/photos
 
@@ -158,6 +168,78 @@ If the camera does not open, allow Camera access, then try again or pass `--came
 
 The demo does not save video and does not enroll anyone it sees.
 
+## Attendance
+
+```bash
+python attend.py run --session "CS101 Lecture" --location "Room 101, Science Block"
+```
+
+The camera window shows each face with its name and attendance state: `checking in...`, then `present 09:02:13` or `late 09:14:40`. The panel shows the session, location, clock, how many enrolled students are checked in, and the latest check-in. Each check-in is also printed in the terminal. Press `q` to end the session. The session is closed and the report is printed.
+
+### When a student is checked in
+
+1. The tracker shows a confirmed name after 3 consecutive matches for the same person on the same face track (`TRACK_SMOOTH_WINDOW`).
+2. That confirmed name must then hold for 5 more recognition steps (`--confirm-steps`, `ATTENDANCE_CONFIRM_STEPS`). At the default `--process-every 3` that is roughly half a second of steady recognition.
+3. When two faces in the same frame resolve to the same student, neither is marked and both are labeled `duplicate face, not marked`. A phone photo held next to the real student is a typical cause.
+4. A student is checked in once per session. After that, their last-seen time and position are updated at most every 10 seconds (`ATTENDANCE_SIGHTING_INTERVAL_SECONDS`), and each update is kept as a sighting.
+
+### Timestamp and location
+
+| Field | Meaning |
+| --- | --- |
+| `first_seen` | Check-in time, local time with UTC offset, e.g. `2026-11-19T09:02:13+01:00` |
+| `last_seen` | Most recent sighting |
+| `status` | `present`, `late` (after `--late-after` minutes), or `absent` (enrolled, never seen) |
+| `location` | Where the student checked in: the `--location` of that camera |
+| `zone` | Where the face was in the camera view, on a 3x3 grid: `top-left` … `bottom-right` |
+| `last_location`, `last_zone` | Where the student was most recently seen |
+| sightings | Every throttled sighting with time, camera, location, optional GPS, zone, face center (0–1) and score |
+
+The location of a student is the location of the camera that saw them, as with a fixed CCTV camera. A Mac has no GPS, so pass coordinates yourself if you want them stored: `--lat 52.3702 --lon 4.8952`. Zones are in the camera's own view (not mirrored): a student sitting on the camera's left appears in a `-left` zone. Zones in the top row usually mean the back of the room when the camera faces the class from the front.
+
+### Several cameras, or a real CCTV camera
+
+Each camera is a station with its own `--camera-id` and `--location`. A second camera joins an existing session, and both write to the same database:
+
+```bash
+# Terminal 1: built-in camera at the front of the room
+python attend.py run --session "CS101 Lecture" --camera-id front --location "Room 101"
+# Terminal 2: an iPhone (Continuity Camera) or USB camera at the door
+python attend.py run --join 1 --camera 1 --camera-id door --location "Room 101 door"
+```
+
+`--camera` also accepts an RTSP or HTTP stream URL, or a video file. That is how an IP/CCTV camera is used once you have one, for example `--camera "rtsp://user:pass@192.168.1.20:554/stream1"`. The trail (`report --trail`) then shows which camera saw each student, and when.
+
+### Run flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--session NAME` | Start a new session |
+| `--join ID` | Add this camera to a running session instead |
+| `--location` | Where this camera is. Default `Classroom` |
+| `--camera-id` | Name of this camera, letters, numbers, `_`, `-`. Default `mac-camera` |
+| `--lat`, `--lon` | Optional coordinates stored with each sighting |
+| `--late-after MIN` | Check-ins after this many minutes are `late` |
+| `--save-snapshots` | Save the face crop at check-in under `data/attendance/snapshots/session_<id>/` as evidence |
+| `--confirm-steps` | Stable recognition steps before check-in. Default `5` |
+| `--camera` | Webcam index, stream URL, or video file. Default `0` |
+| `--db` | Database file. Default `data/attendance/attendance.db` |
+
+`--width`, `--height`, `--confidence`, `--accept-threshold`, `--margin`, `--process-every`, and `--gallery` work as in the demo.
+
+### Reports
+
+```bash
+python attend.py sessions
+python attend.py report --session-id 1
+python attend.py report --session-id 1 --trail --csv data/attendance/cs101.csv
+python attend.py delete-session --session-id 1
+```
+
+`report` lists present and late students with check-in time, last seen time, and where they were, followed by every enrolled student who was not seen as `absent`. `--trail` adds the timestamped sightings. `--csv` writes the same rows to a spreadsheet-friendly file. `delete-session` removes the session, its sightings, and its snapshots.
+
+Students enrolled from another terminal while a session is running are picked up automatically. The gallery is reloaded when a profile file changes.
+
 ## How a match is decided
 
 YuNet finds each face and five landmarks. Frames are detected at a longest side of 640 px (`--detect-max-side`) and landmarks are mapped back to the full frame. SFace aligns the face and returns a 128-d embedding. Embeddings are L2-normalized in this project.
@@ -238,6 +320,12 @@ Defaults live in `config.py`.
 | `TRACK_IOU_THRESHOLD` | 0.3 | Track match overlap |
 | `TRACK_SMOOTH_WINDOW` | 3 | Consecutive known results before a name is shown |
 | `TRACK_MAX_MISSED` | 8 | Frames a track can miss before it is dropped |
+| `ATTENDANCE_DB` | `data/attendance/attendance.db` | Attendance database |
+| `ATTENDANCE_SNAPSHOT_DIR` | `data/attendance/snapshots` | Check-in face crops with `--save-snapshots` |
+| `ATTENDANCE_CONFIRM_STEPS` | 5 | Stable confirmed steps before check-in |
+| `ATTENDANCE_SIGHTING_INTERVAL_SECONDS` | 10 | Minimum gap between stored sightings per student |
+| `DEFAULT_CAMERA_ID` | `mac-camera` | Camera name when `--camera-id` is omitted |
+| `DEFAULT_LOCATION` | `Classroom` | Location when `--location` is omitted |
 
 ## Models
 
@@ -261,7 +349,7 @@ source .venv/bin/activate
 python -m pytest
 ```
 
-`tests/test_models_integration.py` runs the real ONNX files when they are present. The other tests use stand-ins and do not need the webcam.
+`tests/test_models_integration.py` runs the real ONNX files when they are present. The other tests use stand-ins and do not need the webcam. `tests/test_attendance.py` covers check-in rules, late status, duplicate faces, sighting throttling, reports, CSV export, and the gallery cache. 70 tests pass as of 19 November 2026.
 
 ## Checked on 19 October 2026
 
@@ -287,11 +375,11 @@ python demo.py
 
 Still open: enroll real people, capture separate calibration and final sessions, and set thresholds from the calibration sweep before trusting the final report. Revisit the margin and acceptance threshold when the gallery grows.
 
-`AttendanceLogger` in `face_detection.py` remains importable for the earlier examples. The demo does not call it. Attendance marking, CCTV, remote cameras, and background monitoring are outside this demo.
-
 ## Limits
 
-A photograph or screen showing an enrolled person can be accepted. This is ordinary face matching. It does not check liveness.
+A photograph or screen showing an enrolled person can be accepted, and would mark that student present. This is ordinary face matching. It does not check liveness. The duplicate-face rule only catches a photo shown next to the real student. Use `--save-snapshots` if check-ins need to be reviewed.
+
+Attendance records are personal data. Enroll only students who agreed, tell them what is recorded (time, camera location, position in view, and optionally a face crop), and delete sessions you no longer need.
 
 Detector confidence is the YuNet face score. The number drawn next to a name is cosine similarity.
 
@@ -307,6 +395,8 @@ Thresholds will drift as the gallery grows and should be recalibrated on a fresh
 | `quality.py` | Size, blur, brightness, pose, and near-duplicate checks |
 | `camera.py` | Open, latest frame, and release, including after an error |
 | `tracking.py` | Match boxes by IoU and hold a name only while the identity stays stable |
+| `attendance.py` | `Station`, zones, `AttendanceStore` (SQLite), `AttendanceMarker`, report and CSV |
+| `attend.py` | Live attendance session on top of the demo loop, plus report commands |
 | `enroll.py` | Consent prompt, webcam capture, and folder enrollment |
 | `demo.py` | Draw boxes, status, score, and FPS |
 | `evaluate.py` | Per-image decisions, rates, calibration sweep, and JSON report |

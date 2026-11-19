@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from face_detection import (
     Face, FaceDetector, DetectionResult,
-    FaceRecognizer, AttendanceLogger
+    FaceRecognizer
 )
 
 

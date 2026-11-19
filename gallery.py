@@ -82,6 +82,7 @@ class Gallery:
         self.root = Path(root)
         self.detector_sha256 = detector_sha256
         self.recognizer_sha256 = recognizer_sha256
+        self._records_cache: Optional[tuple[tuple, list[IdentityRecord]]] = None
 
     def person_dir(self, person_id: str) -> Path:
         return self.root / validate_person_id(person_id)
@@ -105,7 +106,34 @@ class Gallery:
         return profiles
 
     def identity_records(self) -> list[IdentityRecord]:
-        """Load embeddings for matching. Raise if any profile uses other weights."""
+        """Load embeddings for matching. Raise if any profile uses other weights.
+
+        Results are reused until a profile file changes on disk, so a profile
+        enrolled from another process is picked up on the next call.
+        """
+        signature = self._signature()
+        if self._records_cache is not None and self._records_cache[0] == signature:
+            return list(self._records_cache[1])
+        records = self._load_records()
+        self._records_cache = (signature, records)
+        return list(records)
+
+    def _signature(self) -> tuple:
+        if not self.root.exists():
+            return ()
+        entries = []
+        for path in sorted(self.root.iterdir()):
+            if not path.is_dir():
+                continue
+            for name in ("profile.json", "embeddings.npy"):
+                try:
+                    stat = (path / name).stat()
+                except FileNotFoundError:
+                    continue
+                entries.append((path.name, name, stat.st_mtime_ns, stat.st_size))
+        return tuple(entries)
+
+    def _load_records(self) -> list[IdentityRecord]:
         records = []
         for metadata in self.list_profiles():
             if not metadata["model_match"]:

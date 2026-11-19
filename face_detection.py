@@ -273,27 +273,6 @@ class FaceRecognizer:
         return detection_result
 
 
-class AttendanceLogger:
-    """Kept so older examples still import. The webcam demo does not mark attendance."""
-
-    @staticmethod
-    def log_detection_event(frame_idx: int, num_faces: int, avg_confidence: float) -> None:
-        detection_logger.info(
-            "Frame %s: Detected %s face(s), avg detector score: %.4f",
-            frame_idx,
-            num_faces,
-            avg_confidence,
-        )
-
-    @staticmethod
-    def log_recognition_event(student_id: str, confidence: float) -> None:
-        recognition_logger.info("Recognition event: %s, score: %.4f", student_id, confidence)
-
-    @staticmethod
-    def log_attendance_mark(student_id: str, timestamp: str) -> None:
-        recognition_logger.info("Attendance mark requested for %s at %s", student_id, timestamp)
-
-
 def model_path_default(filename: str) -> Path:
     return model_path(filename)
 

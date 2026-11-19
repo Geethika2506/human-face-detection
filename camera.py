@@ -20,8 +20,15 @@ class CameraError(RuntimeError):
     """The webcam could not be opened or a frame could not be read."""
 
 
+def parse_source(value: str) -> int | str:
+    """``"0"`` selects a webcam index. Anything else (an RTSP/HTTP URL or a video
+    file path) is passed to OpenCV unchanged, which is how a CCTV stream is used."""
+    text = str(value).strip()
+    return int(text) if text.isdigit() else text
+
+
 class Camera:
-    def __init__(self, index: int = 0, width: int = 1280, height: int = 720):
+    def __init__(self, index: int | str = 0, width: int = 1280, height: int = 720):
         self.index = index
         self.width = width
         self.height = height

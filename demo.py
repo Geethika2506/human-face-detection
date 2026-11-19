@@ -12,7 +12,7 @@ import time
 import cv2
 
 import config
-from camera import Camera, CameraError, take_frame, use_camera
+from camera import Camera, CameraError, parse_source, take_frame, use_camera
 from face_detection import FaceDetector, FaceRecognizer
 from gallery import Gallery, GalleryError
 from model_assets import DETECTOR_SHA256, ModelAssetError, RECOGNIZER_SHA256
@@ -20,9 +20,11 @@ from tracking import Observation, Tracker
 
 
 class FaceRecognitionDemo:
+    window_title = "Face recognition"
+
     def __init__(
         self,
-        camera_index: int = config.DEFAULT_CAMERA_INDEX,
+        camera_index: int | str = config.DEFAULT_CAMERA_INDEX,
         confidence_threshold: float = config.DETECTION_CONFIDENCE_DEFAULT,
         accept_threshold: float = config.ACCEPT_THRESHOLD,
         match_margin: float = config.MATCH_MARGIN,
@@ -55,9 +57,23 @@ class FaceRecognitionDemo:
         self.fps = 0.0
         self.process_ms = 0.0
 
-    def run(self) -> None:
+    def on_tracks(self, frame, tracks) -> None:
+        """Called after each recognition step with the updated tracks."""
+
+    def panel_lines(self) -> list[str]:
+        """Extra lines drawn in the status panel."""
+        return []
+
+    def track_tags(self) -> dict[int, str]:
+        """Text appended to a track's label, keyed by track id."""
+        return {}
+
+    def announce(self) -> None:
         print("Face recognition demo")
         print("Press q to quit. Nothing is recorded.")
+
+    def run(self) -> None:
+        self.announce()
         print(
             f"Cosine accept threshold {self.accept_threshold:.3f}, "
             f"margin {self.match_margin:.3f}."
@@ -88,6 +104,7 @@ class FaceRecognitionDemo:
                     self.recognizer.batch_recognize(detection, frame)
                     observations = [_observation(face) for face in detection.detected_faces]
                     tracks = self.tracker.update(observations)
+                    self.on_tracks(frame, tracks)
                     self.process_ms = (time.perf_counter() - started) * 1000.0
                 annotated = draw_frame(
                     frame,
@@ -96,8 +113,10 @@ class FaceRecognitionDemo:
                     self.process_ms,
                     self.accept_threshold,
                     self.match_margin,
+                    extra_lines=self.panel_lines(),
+                    tags=self.track_tags(),
                 )
-                cv2.imshow("Face recognition", annotated)
+                cv2.imshow(self.window_title, annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     print("Quit.")
                     break
@@ -106,21 +125,37 @@ class FaceRecognitionDemo:
         print(f"Frames processed by the detector: {self.detector.frame_count}")
 
 
-def draw_frame(frame, tracks, fps: float, process_ms: float, accept_threshold: float, match_margin: float):
+def draw_frame(
+    frame,
+    tracks,
+    fps: float,
+    process_ms: float,
+    accept_threshold: float,
+    match_margin: float,
+    extra_lines: list[str] | None = None,
+    tags: dict[int, str] | None = None,
+):
     annotated = frame.copy()
+    tags = tags or {}
     for track in tracks:
         x, y, width, height = track.bbox
         color = _color(track.label)
         cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 2)
         text = track.label if not track.score_text else f"{track.label}  {track.score_text}"
+        if track.track_id in tags:
+            text = f"{text}  {tags[track.track_id]}"
         _draw_label(annotated, text, x, y, color)
-    lines = [
+    lines = list(extra_lines or []) + [
         f"FPS {fps:.1f}   recognition {process_ms:.0f} ms",
         f"accept {accept_threshold:.3f}   margin {match_margin:.3f}",
         "q quit",
     ]
     panel_height = 18 * len(lines) + 12
-    cv2.rectangle(annotated, (8, 8), (360, 8 + panel_height), (0, 0, 0), -1)
+    text_width = max(
+        cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0] for line in lines
+    )
+    panel_right = min(annotated.shape[1] - 8, max(360, 24 + text_width))
+    cv2.rectangle(annotated, (8, 8), (panel_right, 8 + panel_height), (0, 0, 0), -1)
     for index, line in enumerate(lines):
         cv2.putText(
             annotated,
@@ -165,7 +200,12 @@ def _draw_label(frame, text: str, x: int, y: int, color: tuple[int, int, int]) -
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local webcam face-recognition demo")
-    parser.add_argument("--camera", type=int, default=config.DEFAULT_CAMERA_INDEX)
+    parser.add_argument(
+        "--camera",
+        type=parse_source,
+        default=config.DEFAULT_CAMERA_INDEX,
+        help="Webcam index, or an RTSP/HTTP stream URL or video file",
+    )
     parser.add_argument("--width", type=int, default=config.CAMERA_FRAME_WIDTH)
     parser.add_argument("--height", type=int, default=config.CAMERA_FRAME_HEIGHT)
     parser.add_argument("--confidence", type=float, default=config.DETECTION_CONFIDENCE_DEFAULT)

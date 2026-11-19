@@ -45,3 +45,14 @@ REPORTS_DIR = "data/reports"
 TRACK_IOU_THRESHOLD = 0.3
 TRACK_SMOOTH_WINDOW = 3
 TRACK_MAX_MISSED = 8
+
+# Attendance. A student is checked in after their confirmed name has held on
+# one track for this many consecutive recognition steps (on top of the
+# smoothing window above).
+ATTENDANCE_DB = "data/attendance/attendance.db"
+ATTENDANCE_SNAPSHOT_DIR = "data/attendance/snapshots"
+ATTENDANCE_CONFIRM_STEPS = 5
+# A student's last-seen time and position are written at most this often.
+ATTENDANCE_SIGHTING_INTERVAL_SECONDS = 10.0
+DEFAULT_CAMERA_ID = "mac-camera"
+DEFAULT_LOCATION = "Classroom"

@@ -30,6 +30,8 @@ class Track:
     missed: int = 0
     label: str = "Unknown"
     score_text: str = ""
+    # Set only while the label shows a confirmed known person.
+    person_id: Optional[str] = None
 
     def note(self, observation: Observation, smooth_window: int) -> None:
         previous_id = _last_known_id(self.history)
@@ -44,6 +46,7 @@ class Track:
         self.bbox = observation.bbox
         self.missed = 0
         self.label, self.score_text = label_for(self.history, smooth_window)
+        self.person_id = confirmed_person_id(self.history, smooth_window)
 
 
 class Tracker:
@@ -106,15 +109,23 @@ def label_for(history: deque, smooth_window: int) -> tuple[str, str]:
     score_text = "" if latest.match_score is None else f"score {latest.match_score:.3f}"
     if latest.status == "uncertain":
         return "Uncertain", score_text
-    if latest.status != "known":
+    if confirmed_person_id(history, smooth_window) is None:
         return "Unknown", score_text
+    return latest.display_name or "Unknown", score_text
+
+
+def confirmed_person_id(history: deque, smooth_window: int) -> Optional[str]:
+    """Person id when the last ``smooth_window`` results all agree, else None."""
+    if not history:
+        return None
+    latest = history[-1]
+    if latest.status != "known" or not latest.person_id:
+        return None
     recent = list(history)[-smooth_window:]
     confirmed = len(recent) >= smooth_window and all(
         item.status == "known" and item.person_id == latest.person_id for item in recent
     )
-    if not confirmed:
-        return "Unknown", score_text
-    return latest.display_name or "Unknown", score_text
+    return latest.person_id if confirmed else None
 
 
 def iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> float:
